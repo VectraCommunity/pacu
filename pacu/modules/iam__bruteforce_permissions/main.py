@@ -121,11 +121,11 @@ def error_delegator(error):
                     kwargs[dict_name].update(temp_dict)
             else:
                 # Convert list of strings to list of dicts of invalid list subtype found.
-                if param_name[:-3] == '[0]':
-                    kwargs[param_name] = [{'DryRun': True}]
-                else:
-                    valid_type = line.split("'")[3]
-                    kwargs[param_name] = invalid_param(valid_type)
+                # if param_name[:-3] == '[0]':
+                #     kwargs[param_name] = [{'DryRun': True}]
+                # else:
+                valid_type = line.split("'")[3]
+                kwargs[param_name] = invalid_param(valid_type)
     return kwargs
 
 
@@ -320,8 +320,8 @@ def main(args, pacu_main):
                     kwargs = dict(((arg, 'dummydata') for arg in getattr(op.input_shape, 'required_members', [])))
 
                     members = getattr(op.input_shape, 'members', {})
-                    if members.get('DryRun'):
-                        kwargs['DryRun'] = True
+                    # if members.get('DryRun'):
+                    #     kwargs['DryRun'] = True
 
                     if members.get('AvailabilityZone'):
                         kwargs['AvailabilityZone'] = current_region

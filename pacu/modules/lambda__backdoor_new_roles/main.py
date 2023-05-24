@@ -171,7 +171,7 @@ def main(args, pacu_main):
 
     try:
         #function_name = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(15))
-        function_name = 'MaliciousLambdaFunction'
+        function_name = 'MaliciousLambdaFunction-cw'
         response = client.create_function(
             FunctionName=function_name,
             Runtime='python3.9',
@@ -187,7 +187,7 @@ def main(args, pacu_main):
         created_resources['LambdaFunctions'].append(function_name)
 
         client = pacu_main.get_boto3_client('events', 'us-east-1')
-        rule_name = 'TriggerForMaliciousFunction'
+        rule_name = 'TriggerForMaliciousFunction-cw'
         response = client.put_rule(
             Name=rule_name,
             EventPattern='{"source":["aws.iam"],"detail-type":["AWS API Call via CloudTrail"],"detail":{"eventSource":["iam.amazonaws.com"],"eventName":["CreateRole"]}}',
