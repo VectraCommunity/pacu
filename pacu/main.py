@@ -1294,6 +1294,8 @@ aws_secret_access_key = {}
             new_value = ""
             while (new_value.strip().lower() != 'c') and (len(new_value) < 2):
                 new_value = self.input('Key alias [{}]: '.format(session.key_alias))
+                if new_value == '':
+                    new_value = str(session.key_alias)
         else:
             new_value = key_alias.strip()
             self.print('Key alias [{}]: {}'.format(session.key_alias, new_value), output='file')
@@ -1756,6 +1758,18 @@ aws_secret_access_key = {}
             n_session.activate(self.database)
         if activate_session is True:
             self.activate_session(session)
+        if session is not None:
+            session_names = [x.name for x in sessions]
+
+            if session not in session_names:
+                print('Choose from the following sessions:')
+                for _session in sessions:
+                    print('  {}'.format(_session.name))
+                print('Session could not be found. Exiting...')
+                self.exit()
+
+            self.activate_session(session)
+
         if set_keys is not None:
             keys = set_keys.split(',')
             alias = keys[0]
@@ -1765,16 +1779,6 @@ aws_secret_access_key = {}
                 self.set_keys(alias, access_key, secert_key, keys[3])
             else:
                 self.set_keys(alias, access_key, secert_key)
-
-        if session is not None:
-            session_names = [x.name for x in sessions]
-
-            if session not in session_names:
-                print('Session could not be found. Exiting...')
-                self.exit()
-
-            session_index = session_names.index(session)
-            sessions[session_index].is_active = True
 
         if module_name is not None:
             module = ['exec', module_name]
