@@ -176,7 +176,7 @@ def main(args, pacu_main):
             FunctionName=function_name,
             Runtime='python3.9',
             Role=target_role_arn,
-            Timeout=60,
+            Timeout=30,
             Handler='lambda_function.lambda_handler',
             Code={
                 'ZipFile': zip_file_bytes
