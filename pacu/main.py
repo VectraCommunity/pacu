@@ -17,7 +17,6 @@ from typing import List, Optional, Any, Dict, Union, Tuple
 
 from pacu.core import lib
 from pacu.core.lib import session_dir
-from datetime import datetime
 
 try:
     import jq  # type: ignore
@@ -28,17 +27,19 @@ try:
     import botocore.session
     import botocore.exceptions
     import urllib.parse
+    import toml
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from pacu import settings
 
     from pacu.core.models import AWSKey, PacuSession, migrations
     from pacu.setup_database import setup_database_if_not_present
     from sqlalchemy import exc, orm  # type: ignore
-    from pacu.utils import get_database_connection, set_sigint_handler
+    from pacu.utils import get_database_connection, set_sigint_handler, decode_accesskey_id
 except ModuleNotFoundError:
     exception_type, exception_value, tb = sys.exc_info()
     print('Traceback (most recent call last):\n{}{}: {}\n'.format(''.join(traceback.format_tb(tb)), str(exception_type), str(exception_value)))
-    print('Pacu was not able to start because a required Python package was not found.\nRun `sh install.sh` to check and install Pacu\'s Python requirements.')
+    print('Refer to https://github.com/RhinoSecurityLabs/pacu/wiki/Installation')
     sys.exit(1)
 
 
@@ -351,84 +352,19 @@ class Main:
         with open(Path(__file__).parent/'modules/service_regions.json', 'r') as regions_file:
             regions = json.load(regions_file)
 
-        # TODO: Add an option for GovCloud regions
-
-        if service == 'all':
+        # Try to get the regions for the service, if the service does not exist just set to all
+        try:
+            valid_regions = regions[service]
+        except KeyError:
             valid_regions = regions['all']
-            if 'local' in valid_regions:
-                valid_regions.remove('local')
-            if 'af-south-1' in valid_regions:
-                valid_regions.remove('af-south-1')  # Doesn't work currently
-            if 'ap-east-1' in valid_regions:
-                valid_regions.remove('ap-east-1')
-            if 'eu-south-1' in valid_regions:
-                valid_regions.remove('eu-south-1')
-            if 'me-south-1' in valid_regions:
-                valid_regions.remove('me-south-1')
-        if type(regions[service]) == dict and regions[service].get('endpoints'):
-            if 'aws-global' in regions[service]['endpoints']:
-                return [None]
-            if 'all' in session.session_regions:
-                valid_regions = list(regions[service]['endpoints'].keys())
-                if 'local' in valid_regions:
-                    valid_regions.remove('local')
-                if 'af-south-1' in valid_regions:
-                    valid_regions.remove('af-south-1')
-                if 'ap-east-1' in valid_regions:
-                    valid_regions.remove('ap-east-1')
-                if 'eu-south-1' in valid_regions:
-                    valid_regions.remove('eu-south-1')
-                if 'me-south-1' in valid_regions:
-                    valid_regions.remove('me-south-1')
-                return valid_regions
+
+        if 'all' not in session.session_regions:
+            if check_session is True:
+                return [region for region in valid_regions if region in session.session_regions]
             else:
-                valid_regions = list(regions[service]['endpoints'].keys())
-                if 'local' in valid_regions:
-                    valid_regions.remove('local')
-                if 'af-south-1' in valid_regions:
-                    valid_regions.remove('af-south-1')
-                if 'ap-east-1' in valid_regions:
-                    valid_regions.remove('ap-east-1')
-                if 'eu-south-1' in valid_regions:
-                    valid_regions.remove('eu-south-1')
-                if 'me-south-1' in valid_regions:
-                    valid_regions.remove('me-south-1')
-                if check_session is True:
-                    return [region for region in valid_regions if region in session.session_regions]
-                else:
-                    return valid_regions
+                return session.session_regions
         else:
-            if 'aws-global' in regions[service]:
-                return [None]
-            if 'all' in session.session_regions:
-                valid_regions = regions[service]
-                if 'local' in valid_regions:
-                    valid_regions.remove('local')
-                if 'af-south-1' in valid_regions:
-                    valid_regions.remove('af-south-1')
-                if 'ap-east-1' in valid_regions:
-                    valid_regions.remove('ap-east-1')
-                if 'eu-south-1' in valid_regions:
-                    valid_regions.remove('eu-south-1')
-                if 'me-south-1' in valid_regions:
-                    valid_regions.remove('me-south-1')
-                return valid_regions
-            else:
-                valid_regions = regions[service]
-                if 'local' in valid_regions:
-                    valid_regions.remove('local')
-                if 'af-south-1' in valid_regions:
-                    valid_regions.remove('af-south-1')
-                if 'ap-east-1' in valid_regions:
-                    valid_regions.remove('ap-east-1')
-                if 'eu-south-1' in valid_regions:
-                    valid_regions.remove('eu-south-1')
-                if 'me-south-1' in valid_regions:
-                    valid_regions.remove('me-south-1')
-                if check_session is True:
-                    return [region for region in valid_regions if region in session.session_regions]
-                else:
-                    return valid_regions
+            return valid_regions
 
     def display_all_regions(self):
         for region in sorted(self.get_regions('all')):
@@ -465,53 +401,19 @@ class Main:
                 self.exec_module(['exec', module])
         return True
 
-    def check_for_updates(self):
-        TIME_FORMAT = '%Y-%m-%d'
-        UPDATE_CYCLE = 7  # Days
-        UPDATE_INFO_PATH = lib.home_dir()/'update_info.json'
-        LAST_UPDATE_PATH = lib.pacu_dir()/'last_update.txt'
-        UPDATE_MSG = '''Pacu has a new version available! Clone it from GitHub to receive the updates.
-        git clone https://github.com/RhinoSecurityLabs/pacu.git'''
-
-        with open(LAST_UPDATE_PATH, 'r') as f:
-            local_last_update = f.read().rstrip()
-
-        datetime_now = datetime.now()
-        datetime_local = datetime.strptime(local_last_update, TIME_FORMAT)
-
-        datetime_last_check = datetime.min
-        latest_cached = datetime.min
-
-        # update_info.json structure:
-        # { 'last_check':'YYYY-MM-DD', 'latest_cached':'YYYY-MM-DD'}
-        # Create a update_info.json if not exist
-        update_info = {}
-        if os.path.isfile(UPDATE_INFO_PATH):
-            with open(UPDATE_INFO_PATH, 'r') as f:
-                update_info = json.load(f)
-                datetime_last_check = datetime.strptime(update_info['last_check'], TIME_FORMAT)
-                latest_cached = datetime.strptime(update_info['latest_cached'], TIME_FORMAT)
-
-        # Check upstream
-        if (datetime_now - datetime_last_check).days >= UPDATE_CYCLE:
-            latest_update = requests.get(
-                'https://raw.githubusercontent.com/RhinoSecurityLabs/pacu/master/pacu/last_update.txt').text.rstrip()
-            latest = datetime.strptime(latest_update, TIME_FORMAT)
-
-            update_info['latest_cached'] = latest.strftime(TIME_FORMAT)
-            update_info['last_check'] = datetime_now.strftime(TIME_FORMAT)
-            with open(UPDATE_INFO_PATH, 'w') as f:
-                json.dump(update_info, f)
-
-            if datetime_local < latest:
-                print(UPDATE_MSG)
-                return True
-        # Local check
-        elif datetime_local < latest_cached:
-            print(datetime_local, latest_cached)
-            print(UPDATE_MSG)
-            return True
-        return False
+    def get_pacu_version(self):
+        try:
+            # Get the directory where this file is located
+            current_dir = os.path.dirname(__file__)
+            # Go up one level to the root of package
+            package_root = os.path.abspath(os.path.join(current_dir, os.pardir))
+            # Construct the path to pyproject.toml
+            toml_path = os.path.join(package_root, 'pyproject.toml')
+            with open(toml_path, 'r') as file:
+                pyproject = toml.load(file)
+            return pyproject['tool']['poetry']['version']
+        except Exception:
+            return "unknown"
 
     def key_info(self, alias='') -> Union[Dict[str, Any], bool]:
         """ Return the set of information stored in the session's active key
@@ -744,7 +646,7 @@ class Main:
 
     def parse_awscli_keys_import(self, command):
         if len(command) == 1:
-            self.display_command_help('import_keys')
+            self.import_awscli_key_default()
             return
 
         boto3_session = boto3.session.Session()
@@ -756,6 +658,14 @@ class Main:
             return
 
         self.import_awscli_key(command[1])
+
+    def import_awscli_key_default(self) -> None:
+        answer = input('  No profile specified, do you want to use the systems default credentials? (y/n): ')
+        if answer.lower() == 'y':
+            self.set_keys(key_alias='import_from_default', access_key_id='c', secret_access_key='c', session_token='c')
+            self.get_boto_session()
+        else:
+            print('  No keys imported.')
 
     def import_awscli_key(self, profile_name: str) -> None:
         try:
@@ -906,68 +816,62 @@ class Main:
             print(f"Using user agent suffix {user_agent_suffix}")
 
     def update_regions(self) -> None:
-        py_executable = sys.executable
-        # Update botocore to fetch the latest version of the AWS region_list
+        def get_aws_regions_and_services():
+            # Create a SSM client from the session
+            client = self.get_boto3_client('ssm')
 
-        cmd = [py_executable, '-m', 'pip', 'install', '--upgrade', 'botocore']
-        try:
-            self.print('  Fetching latest botocore...\n')
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            self.print('"{}" returned {}'.format(' '.join(cmd), e.returncode))
-            pip = self.input('Could not use pip3 or pip to update botocore to the latest version. Enter the name of '
-                             'your pip binary to continue: ').strip()
-            subprocess.run(['{}'.format(pip), 'install', '--upgrade', 'botocore'])
+            def get_all_parameters(path):
+                """Retrieve all parameters under a specified path, handling pagination"""
+                parameters = []
+                paginator = client.get_paginator('get_parameters_by_path')
 
-        path = ''
+                for page in paginator.paginate(Path=path):
+                    parameters.extend(page['Parameters'])
 
-        try:
-            self.print('  Using pip3 to locate botocore...\n')
-            output = subprocess.check_output('{} -m pip show botocore'.format(py_executable), shell=True)
-        except subprocess.CalledProcessError as e:
-            self.print('Cmd: "{}" returned {}'.format(' '.join(cmd), e.returncode))
-            path = self.input('Could not use pip to determine botocore\'s location. Enter the path to your Python '
-                              '"dist-packages" folder (example: /usr/local/bin/python3.6/lib/dist-packages): ').strip()
+                return parameters
 
-        if path == '':
-            # Account for Windows \r and \\ in file path (Windows)
-            rows = output.decode('utf-8').replace('\r', '').replace('\\\\', '/').split('\n')
-            for row in rows:
-                if row.startswith('Location: '):
-                    path = row.split('Location: ')[1]
+            # Function to process each service and fetch its regions
+            def process_service(service):
+                service_regions = get_all_parameters(f'/aws/service/global-infrastructure/services/{service}/regions')
+                return service, [param['Value'] for param in service_regions]
 
-        with open('{}/botocore/data/endpoints.json'.format(path), 'r+') as regions_file:
-            endpoints = json.load(regions_file)
+            # Retrieve all regions
+            all_regions = get_all_parameters('/aws/service/global-infrastructure/regions')
 
-        for partition in endpoints['partitions']:
-            if partition['partition'] == 'aws':
-                regions: Dict[str, Any] = dict()
-                regions['all'] = list(partition['regions'].keys())
-                for service in partition['services']:
-                    # fips regions are an alternate endpoint for already existing regions, to prevent duplicates we'll
-                    # filter these out for now.
-                    regions[service] = {'endpoints': {}}
-                    for region in filter(lambda r: 'fips' not in r, partition['services'][service]['endpoints'].keys()):
-                        regions[service]['endpoints'][region] = partition['services'][service]['endpoints'][region]
+            # Retrieve all services
+            all_services = get_all_parameters('/aws/service/global-infrastructure/services')
 
-        with open(Path(__file__).parent/'modules/service_regions.json', 'w+') as services_file:
-            json.dump(regions, services_file, default=str, sort_keys=True)
+            # Extract region and service names
+            region_names = [param['Value'] for param in all_regions]
+            service_names = [param['Value'] for param in all_services]
 
-        self.print('  Region list updated to the latest version!')
+            # Initialize JSON object
+            regions_services = {"all": region_names}
+
+            # Use ThreadPoolExecutor to parallelize fetching regions for each service
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                # Start the load operations and mark each future with its service
+                future_to_service = {executor.submit(process_service, service): service for service in service_names}
+                for future in as_completed(future_to_service):
+                    service, regions = future.result()
+                    regions_services[service] = regions
+
+            return regions_services
+
+        answer = input("  This requires calls to the AWS SSM API using the currently configure credentials. Continue? (y/n) ")
+        if answer.lower() == 'y':
+            print('  Updating region list...')
+            regions_services_json = get_aws_regions_and_services()
+
+            with open(Path(__file__).parent/'modules/service_regions.json', 'w+') as services_file:
+                json.dump(regions_services_json, services_file, default=str, sort_keys=True, indent=4)
+
+            self.print('  Region list updated to the latest version!')
+        else:
+            self.print('  Region list not updated.')
 
     def print_web_console_url(self) -> None:
         active_session = self.get_active_session()
-
-        if active_session.key_alias is None:
-            print('  No keys have been set. Not generating the URL.')
-            return
-        if not active_session.access_key_id:
-            print('  No access key has been set. Not generating the URL.')
-            return
-        if not active_session.secret_access_key:
-            print('  No secret key has been set. Not generating the URL.')
-            return
-
         sts = self.get_boto3_client('sts')
 
         if active_session.session_token:
@@ -1033,26 +937,25 @@ class Main:
     def export_keys(self, command) -> None:
         export = input('Export the active keys to the AWS CLI credentials file (~/.aws/credentials)? (y/n) ').rstrip()
 
-        if export.lower() == 'y':
-            session = self.get_active_session()
+        session = self.get_active_session()
 
-            if not session.access_key_id:
-                print('  No access key has been set. Not exporting credentials.')
-                return
-            if not session.secret_access_key:
-                print('  No secret key has been set. Not exporting credentials.')
-                return
+        if not session.access_key_id:
+            print('  No access key has been set. Not exporting credentials.')
+            return
+        if not session.secret_access_key:
+            print('  No secret key has been set. Not exporting credentials.')
+            return
 
-            config = """
+        config = """
 \n\n[{}]
 aws_access_key_id = {}
 aws_secret_access_key = {}
 """.format(session.key_alias, session.access_key_id, session.secret_access_key)
-            if session.session_token:
-                config = config + 'aws_session_token = "{}"'.format(session.session_token)
+        if session.session_token:
+            config = config + 'aws_session_token = "{}"'.format(session.session_token)
 
-            config = config + '\n'
-
+        config = config + '\n'
+        if export.lower() == 'y':
             with open('{}/.aws/credentials'.format(os.path.expanduser('~')), 'a+') as f:
                 f.write(config)
 
@@ -1060,6 +963,7 @@ aws_secret_access_key = {}
                 session.key_alias, session.key_alias
             ))
         else:
+            print(config)
             return
 
     # ***** Some module notes *****
@@ -1069,15 +973,6 @@ aws_secret_access_key = {}
     #
     def exec_module(self, command: List[str]) -> None:
         session = self.get_active_session()
-
-        # Run key checks so that if no keys have been set, Pacu doesn't default to
-        # the AWSCLI default profile:
-        if not session.access_key_id:
-            print('  No access key has been set. Not running module.')
-            return
-        if not session.secret_access_key:
-            print('  No secret key has been set. Not running module.')
-            return
 
         module_name = command[1].lower()
         module = import_module_by_name(module_name, include=['main', 'module_info', 'summary'])
@@ -1147,9 +1042,9 @@ aws_secret_access_key = {}
         if command_name == 'list' or command_name == 'ls':
             print('\n    list/ls\n        List all modules\n')
         elif command_name == 'import_keys':
-            print('\n    import_keys <profile name>|--all\n      Import AWS keys from the AWS CLI credentials file (located at ~/.aws/credentials) to the '
+            print('\n    import_keys [profile name]|--all\n      Import AWS keys from the AWS CLI credentials file (located at ~/.aws/credentials) to the '
                   'current sessions database. Enter the name of a profile you would like to import or supply --all to import all the credentials in the '
-                  'file.\n')
+                  'file. No argument will import the default system AWS credentials.\n')
         elif command_name == 'assume_role':
             print('\n    assume_role <role arn>\n        Call AssumeRole on the specified role from the current credentials, add the resulting temporary '
                   'keys to the Pacu key database and start using these new credentials.')
@@ -1298,6 +1193,7 @@ aws_secret_access_key = {}
 
     def set_keys(self, key_alias: str = None, access_key_id: str = None, secret_access_key: str = None, session_token: str = None):
         session = self.get_active_session()
+        reservered_key_names = ['imported-', 'from_default-', 'import_from_default']
 
         # If key_alias is None, then it's being run normally from the command line (set_keys),
         # otherwise it means it is set programmatically and we don't want any prompts if it is
@@ -1316,6 +1212,9 @@ aws_secret_access_key = {}
                 new_value = self.input('Key alias [{}]: '.format(session.key_alias))
                 if new_value == '':
                     new_value = str(session.key_alias)
+                if any([new_value.startswith(n) for n in reservered_key_names]):
+                    self.print(f'Key alias cannot start with "{", ".join(reservered_key_names)}"')
+                    new_value = ""
         else:
             new_value = key_alias.strip()
             self.print('Key alias [{}]: {}'.format(session.key_alias, new_value), output='file')
@@ -1571,14 +1470,45 @@ aws_secret_access_key = {}
                 self.print('    {}'.format(new_ua))
 
     def get_boto_session(self, region: str = None) -> boto3.session.Session:
+        def set_keys_in_session(boto3_sess, key_alias=None):
+            creds = boto3_sess.get_credentials()
+            account_id = decode_accesskey_id(creds.access_key)
+            if not key_alias:
+                key_alias = f'from_default-{account_id}'
+                print(f'  Setting keys for account: {account_id}')
+            self.set_keys(key_alias=key_alias, access_key_id=creds.access_key, secret_access_key=creds.secret_key, session_token=creds.token)
+
         session = self.get_active_session()
+        key_alias = session.key_alias or ''
 
-        if not session.access_key_id:
-            raise UserWarning('  No access key has been set. Failed to generate boto3 Client.')
+        # If the user has not set any keys, check if they want to use the default system credentials
+        if (not session.access_key_id) or (not session.secret_access_key):
+            answer = ''
+            if key_alias != 'import_from_default':
+                answer = input('  Access keys not currently set, do you want to use the system default credentials? (y/n): ')
+            if (answer.lower() == 'y') or (key_alias == 'import_from_default'):
+                self.print('  Setting keys from AWS system default credentials')
+                boto3_session = boto3.session.Session(region_name=region)
+                set_keys_in_session(boto3_session)
+                return boto3_session
+            else:
+                raise UserWarning('  No access keys have been set.')
+                return None
 
-        if not session.secret_access_key:
-            raise UserWarning('  No secret key has been set. Failed to generate boto3 Client.')
+        # Check if the keys were imported from a profile and refresh those creds
+        if key_alias.startswith('imported-'):
+            profile_name = key_alias.replace('imported-', '')
+            boto3_session = boto3.session.Session(profile_name=profile_name)
+            set_keys_in_session(boto3_session, key_alias)
+            return boto3_session
 
+        # Check if the keys were set from system default and refresh
+        if key_alias.startswith('from_default-'):
+            boto3_session = boto3.session.Session(region_name=region)
+            set_keys_in_session(boto3_session, key_alias)
+            return boto3_session
+
+        # If there are explicit keys set, which were not imported just get a session with them
         return boto3.session.Session(
             region_name=region,
             aws_access_key_id=session.access_key_id,
@@ -1847,7 +1777,7 @@ aws_secret_access_key = {}
             try:
                 if not idle_ready:
                     try:
-                        print("""
+                        print(f"""
  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⣶⣿⣿⣿⣿⣿⣿⣶⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⡿⠛⠉⠁⠀⠀⠈⠙⠻⣿⣿⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -1872,6 +1802,7 @@ aws_secret_access_key = {}
  ⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⡏⠉⠉⠉⠉⠀⠀⠀⢸⣿⣿⡏⠉⠉⢹⣿⣿⡇⠀⢸⣿⣿⣇⣀⣀⣸⣿⣿⣿⠀⢸⣿⣿⣿⣀⣀⣀⣿⣿⣿
  ⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⡇⠀⠀⢸⣿⣿⡇⠀⠸⣿⣿⣿⣿⣿⣿⣿⣿⡿⠀⠀⢿⣿⣿⣿⣿⣿⣿⣿⡟
  ⠀⠀⠀⠀⠀⠀⠀⠀⠘⠛⠛⠃⠀⠀⠀⠀⠀⠀⠀⠘⠛⠛⠃⠀⠀⠘⠛⠛⠃⠀⠀⠉⠛⠛⠛⠛⠛⠛⠋⠀⠀⠀⠀⠙⠛⠛⠛⠛⠛⠉⠀
+Version: {self.get_pacu_version()}
 """)
                     except UnicodeEncodeError:
                         pass
@@ -1888,8 +1819,6 @@ aws_secret_access_key = {}
 
                     self.initialize_tab_completion()
                     display_pacu_help()
-
-                    self.check_for_updates()
 
                     idle_ready = True
 
@@ -1968,6 +1897,7 @@ aws_secret_access_key = {}
         parser.add_argument('--exec', action='store_true', help='exec module')
         parser.add_argument('--set-regions', nargs='+', default=None, help='<region1 region2 ...> or <all> for all', metavar='')
         parser.add_argument('--whoami', action='store_true', help='Display information on current IAM user')
+        parser.add_argument('--version', action='version', version=f'Pacu {self.get_pacu_version()}', help='Display Pacu version')
         args = parser.parse_args()
 
         if any([args.session, args.data, args.module_args, args.exec, args.set_regions, args.whoami, args.new_session, args.set_keys, args.activate_session]):
@@ -1976,7 +1906,6 @@ aws_secret_access_key = {}
                 exit()
             self.run_cli(args)
         elif any([args.list_modules, args.pacu_help, args.module_info]):
-            self.check_for_updates()
             self.run_cli(args)
         else:
             self.run_gui()
